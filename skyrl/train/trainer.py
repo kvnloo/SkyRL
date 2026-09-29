@@ -45,6 +45,10 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     get_kl_controller,
 )
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_FIELD,
+    SAMPLE_SUPPORT_PADDING,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
@@ -58,7 +62,7 @@ from skyrl.train.dataset.preprocess import (
     convert_prompts_responses_to_batch_tensors,
     make_router_padding_mask,
 )
-from skyrl.train.evaluate import evaluate, evaluate_step_wise
+from skyrl.train.evaluate import evaluate
 from skyrl.train.generators.base import (
     GeneratorInput,
     GeneratorInterface,
@@ -244,29 +248,16 @@ class RayPPOTrainer:
         Returns:
             A dictionary of evaluation metrics.
         """
-        if self.cfg.generator.step_wise_trajectories:
-            eval_metrics = await evaluate_step_wise(
-                eval_dataloader=self.eval_dataloader,
-                generator=self.generator,
-                cfg=self.cfg,
-                global_step=self.global_step,
-                tokenizer=self.tokenizer,
-                trajectory_logger=self.trajectory_logger,
-                tracker=self.tracker,
-                vllm_metrics_scraper=vllm_metrics_scraper,
-            )
-        else:
-            eval_metrics = await evaluate(
-                eval_dataloader=self.eval_dataloader,
-                generator=self.generator,
-                cfg=self.cfg,
-                global_step=self.global_step,
-                tokenizer=self.tokenizer,
-                trajectory_logger=self.trajectory_logger,
-                tracker=self.tracker,
-                vllm_metrics_scraper=vllm_metrics_scraper,
-            )
-        return eval_metrics
+        return await evaluate(
+            eval_dataloader=self.eval_dataloader,
+            generator=self.generator,
+            cfg=self.cfg,
+            global_step=self.global_step,
+            tokenizer=self.tokenizer,
+            trajectory_logger=self.trajectory_logger,
+            tracker=self.tracker,
+            vllm_metrics_scraper=vllm_metrics_scraper,
+        )
 
     async def train(self):
         """
@@ -492,6 +483,11 @@ class RayPPOTrainer:
                         # 10. Prepare weights for sampling
                         with Timer("sync_weights", self.all_timings):
                             await self.dispatch.save_weights_for_sampler()
+                        # `sync_weights` above is the full bracket: it also pauses and
+                        # resumes generation, which under vLLM DP costs seconds of
+                        # coordinator quiesce that is not weight-sync work. The
+                        # dispatch reports the transfer on its own alongside it.
+                        self.all_timings.update(self.dispatch.get_timing_metrics())
 
                     # 11. set logs
                     logger.info(status)
@@ -555,6 +551,18 @@ class RayPPOTrainer:
                         break
 
                     del training_input, generator_output
+
+                # If dynamic sampling was still accumulating when the dataloader ran out, the step
+                # is left in flight with its `vllm/train` window open. Close it and drop the partial
+                # batch so the next epoch starts clean; otherwise `start('vllm/train')` raises
+                # "called while window 'vllm/train' is still open".
+                if step_started:
+                    if self._vllm_metrics_scraper is not None:
+                        await self._vllm_metrics_scraper.stop()
+                    self.dynamic_sampling_state = None
+                    self.all_metrics = {}
+                    self.all_timings = {}
+                    step_started = False
 
                 self._fire("on_epoch_end")
 
@@ -873,6 +881,7 @@ class RayPPOTrainer:
 
         logprobs: Optional[List[List[float]]] = generator_output.get("rollout_logprobs", None)
         rollout_expert_indices = generator_output.get("rollout_expert_indices", None)
+        rollout_sample_support = generator_output.get("rollout_sample_support", None)
 
         pixel_values = generator_output.get("pixel_values", None)
         image_grid_thw = generator_output.get("image_grid_thw", None)
@@ -895,6 +904,7 @@ class RayPPOTrainer:
             loss_masks_tensor,
             rollout_logprobs_tensor,
             rollout_expert_indices_tensor,
+            rollout_sample_support_tensor,
         ) = convert_prompts_responses_to_batch_tensors(
             self.tokenizer.pad_token_id,
             prompt_ids,
@@ -903,6 +913,7 @@ class RayPPOTrainer:
             loss_masks,
             logprobs,
             rollout_expert_indices,
+            rollout_sample_support,
             max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
         )
         router_padding_mask = None
@@ -933,6 +944,7 @@ class RayPPOTrainer:
                 "rollout_logprobs": rollout_logprobs_tensor,
                 "rollout_expert_indices": rollout_expert_indices_tensor,
                 "router_padding_mask": router_padding_mask,
+                SAMPLE_SUPPORT_FIELD: rollout_sample_support_tensor,
                 "pixel_values": pixel_values,
                 "image_grid_thw": image_grid_thw,
             },
@@ -961,12 +973,26 @@ class RayPPOTrainer:
         training_input.metadata["response_length"] = response_masks_tensor.shape[1]
         batch_num_seq, batch_padded_seq_len = sequences_tensor.shape
         logger.info(f"batch_num_seq: {batch_num_seq}, batch_padded_seq_len: {batch_padded_seq_len}")
-        self.all_metrics.update(
-            {
-                "generate/batch_num_seq": batch_num_seq,
-                "generate/batch_padded_seq_len": batch_padded_seq_len,
-            }
-        )
+        batch_metrics = {
+            "generate/batch_num_seq": batch_num_seq,
+            "generate/batch_padded_seq_len": batch_padded_seq_len,
+        }
+        # Add metrics for sample support replay if enabled
+        if rollout_sample_support_tensor is not None:
+            sample_support = rollout_sample_support_tensor.values
+            valid_per_token = (sample_support != SAMPLE_SUPPORT_PADDING).sum(dim=1)
+            valid_per_token = valid_per_token[valid_per_token > 0]
+            if valid_per_token.numel() > 0:
+                batch_metrics.update(
+                    {
+                        "generate/sample_support_size_mean": valid_per_token.float().mean().item(),
+                        "generate/sample_support_full_fraction": (valid_per_token == sample_support.shape[1])
+                        .float()
+                        .mean()
+                        .item(),
+                    }
+                )
+        self.all_metrics.update(batch_metrics)
         training_input.metadata["avg_response_length"] = sum(
             len(sample_response_ids) for sample_response_ids in response_ids
         ) / len(response_ids)
@@ -1126,16 +1152,16 @@ class RayPPOTrainer:
 
         Expects:
             - `["sequences"]`: Integer[torch.Tensor, "batch_size seqlen"]
-            - `["response_mask"]`: Integer[torch.Tensor, "batch_size seqlen"]
-            - `["loss_mask"]`: Integer[torch.Tensor, "batch_size seqlen"]
-            - `["values"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `["rewards"]`: Float[torch.Tensor, "batch_size seqlen"]
+            - `["response_mask"]`: Integer[torch.Tensor, "batch_size response_len"]
+            - `["loss_mask"]`: Float[torch.Tensor, "batch_size response_len"]
+            - `["values"]`: Float[torch.Tensor, "batch_size response_len"]
+            - `["rewards"]`: Float[torch.Tensor, "batch_size response_len"]
             - `.metadata["uids"]`: List[str]
             - `.metadata["is_last_step"]`: List[bool] for step-wise training
 
         Adds:
-            - `["advantages"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `["returns"]`: Float[torch.Tensor, "batch_size seqlen"]
+            - `["advantages"]`: Float[torch.Tensor, "batch_size response_len"]
+            - `["returns"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         token_level_rewards = data["rewards"]
 
@@ -1151,11 +1177,11 @@ class RayPPOTrainer:
             # Shapes:
             #   traj_ids, (batch_size,):         trajectory id per step (cumsum of shifted is_last_step)
             #   last_step_advantages/returns,
-            #       (num_traj, seqlen):          scalar advantage/return per trajectory at every position
+            #       (num_traj, response_len):          scalar advantage/return per trajectory at every position
             #   last_step_advantages/returns[traj_ids],
-            #       (batch_size, seqlen):        broadcast to every step of the owning trajectory
+            #       (batch_size, response_len):        broadcast to every step of the owning trajectory
             #   response_mask_float,
-            #       (batch_size, seqlen):        per-step response mask
+            #       (batch_size, response_len):        per-step response mask
             last_step_response_mask = data["response_mask"][is_last_step]
             last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards[is_last_step],
@@ -1319,15 +1345,18 @@ class RayPPOTrainer:
             - `.metadata["response_length"]`: Int
 
         Adds:
-            - `["base_action_log_probs"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `["action_log_probs"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `["values"]`: Float[torch.Tensor, "batch_size seqlen"]
+            - `["base_action_log_probs"]`: Float[torch.Tensor, "batch_size response_len"]
+            - `["action_log_probs"]`: Float[torch.Tensor, "batch_size response_len"]
+            - `["values"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         fwd_keys = ["sequences", "attention_mask"]
         if training_input.get("rollout_expert_indices") is not None:
             fwd_keys.append("rollout_expert_indices")
         if training_input.get("router_padding_mask") is not None:
             fwd_keys.append("router_padding_mask")
+        if training_input.get(SAMPLE_SUPPORT_FIELD) is not None:
+            # The scorer validates that captured support backs every loss-active target.
+            fwd_keys.extend([SAMPLE_SUPPORT_FIELD, "loss_mask"])
         if training_input.get("pixel_values") is not None:
             fwd_keys.append("pixel_values")
         if training_input.get("image_grid_thw") is not None:
@@ -1418,7 +1447,7 @@ class RayPPOTrainer:
 
         # single batched computation
         with torch.no_grad():
-            kl: Float[torch.Tensor, "batch_size seqlen"] = compute_approx_kl(  # type: ignore
+            kl: Float[torch.Tensor, "batch_size response_len"] = compute_approx_kl(  # type: ignore
                 action_log_probs,
                 base_action_log_probs,
                 loss_mask=loss_masks_all,
